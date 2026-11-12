@@ -17,7 +17,8 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
 
-from .config import BUSY_TIMEOUT_MS, DB_PATH, ensure_dirs
+from . import config
+from .config import BUSY_TIMEOUT_MS, ensure_dirs
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -95,14 +96,88 @@ CREATE TABLE IF NOT EXISTS batches (
     FOREIGN KEY (center_id) REFERENCES centers (center_id)
 );
 CREATE INDEX IF NOT EXISTS idx_batches_center ON batches (center_id);
+
+-- ----------------------------------------------------------------------- --
+-- Body-part dictionary / index subsystem
+-- ----------------------------------------------------------------------- --
+
+-- A complete "center + raw value -> standard body part" dictionary. The whole
+-- mapping is stored as one JSON document so a dictionary is always applied as
+-- an indivisible unit together with the index built from it.
+CREATE TABLE IF NOT EXISTS body_part_dicts (
+    dict_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    version_label TEXT NOT NULL UNIQUE,
+    entry_count   INTEGER NOT NULL,
+    mapping_json  TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- One row per replacement attempt. At most one row may be in 'building' at a
+-- time (enforced by the partial unique index below); 'active' rows are kept
+-- for history while older active rows become 'superseded'.
+CREATE TABLE IF NOT EXISTS rebuilds (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    dict_id       INTEGER NOT NULL,
+    status        TEXT NOT NULL
+                  CHECK (status IN ('building', 'active', 'superseded', 'failed')),
+    error_detail  TEXT,
+    created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    finished_at   TEXT,
+    FOREIGN KEY (dict_id) REFERENCES body_part_dicts (dict_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rebuilds_single_building
+    ON rebuilds (status) WHERE status = 'building';
+CREATE INDEX IF NOT EXISTS idx_rebuilds_status ON rebuilds (status);
+
+-- The body-part index of the *currently active* dictionary only. Rows of a
+-- dictionary under construction live in body_part_index_staging until the
+-- atomic cutover; failed rebuilds never touch this table.
+CREATE TABLE IF NOT EXISTS body_part_index (
+    instance_id         INTEGER PRIMARY KEY,
+    center_id           TEXT NOT NULL,
+    dict_id             INTEGER NOT NULL,
+    original_body_part  TEXT,
+    standard_body_part  TEXT NOT NULL,
+    FOREIGN KEY (instance_id) REFERENCES instances (id),
+    FOREIGN KEY (dict_id) REFERENCES body_part_dicts (dict_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bpi_lookup
+    ON body_part_index (center_id, standard_body_part);
+
+-- Staging area of a rebuild. The rebuild_id column lets a restarted/failed
+-- attempt clean up its own rows without affecting any other attempt.
+CREATE TABLE IF NOT EXISTS body_part_index_staging (
+    rebuild_id          INTEGER NOT NULL,
+    instance_id         INTEGER NOT NULL,
+    center_id           TEXT NOT NULL,
+    dict_id             INTEGER NOT NULL,
+    original_body_part  TEXT,
+    standard_body_part  TEXT NOT NULL,
+    PRIMARY KEY (rebuild_id, instance_id),
+    FOREIGN KEY (rebuild_id) REFERENCES rebuilds (id)
+);
+CREATE INDEX IF NOT EXISTS idx_bpis_rebuild
+    ON body_part_index_staging (rebuild_id, instance_id);
+
+-- Single-row key/value table for small cross-restart state (currently only the
+-- active dictionary/rebuild pointer).
+CREATE TABLE IF NOT EXISTS app_state (
+    state_key   TEXT PRIMARY KEY,
+    state_value TEXT NOT NULL
+);
 """
 
 
 def get_connection() -> sqlite3.Connection:
-    """Open a SQLite connection with safe pragmas and row access."""
+    """Open a SQLite connection with safe pragmas and row access.
+
+    ``config.DB_PATH`` is read at call time (not bound at import) so tests can
+    redirect the data directory via ``monkeypatch`` for every thread, including
+    background rebuild threads.
+    """
     ensure_dirs()
     conn = sqlite3.connect(
-        DB_PATH,
+        config.DB_PATH,
         timeout=BUSY_TIMEOUT_MS / 1000.0,
         isolation_level=None,  # transactions managed explicitly below
         check_same_thread=False,

@@ -6,6 +6,7 @@ import uuid
 from dataclasses import dataclass
 
 from . import config, dicom_io
+from . import bodypart
 from .config import MAX_FILES_PER_BATCH, ensure_dirs
 from .db import immediate_transaction
 from .uid import remap_uid
@@ -236,6 +237,18 @@ def ingest_batch(center_id: str, files: list[UploadedFile]) -> dict:
                         ),
                     )
                     item["instance_id"] = cur.lastrowid
+
+                    # Index the new instance against the currently active
+                    # body-part dictionary in this same transaction: instance
+                    # and index row commit together. A retransmit reuses the
+                    # existing instance (branch above) and never reaches here,
+                    # so no duplicate index row is possible.
+                    bodypart.index_instance(
+                        conn,
+                        cur.lastrowid,
+                        center_id,
+                        parsed.body_part_examined,
+                    )
 
                     for original_ref in dict.fromkeys(parsed.referenced_sop_uids):
                         new_ref = remap_uid(center_id, original_ref)

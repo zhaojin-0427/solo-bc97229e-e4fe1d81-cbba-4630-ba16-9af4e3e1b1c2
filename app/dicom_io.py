@@ -58,6 +58,11 @@ class ParsedObject:
     original_series_uid: str
     original_sop_uid: str
     modality: str | None
+    # Raw (0018,0015) BodyPartExamined as emitted by the source center. None
+    # means the attribute is absent; an empty/blank string means the center
+    # sent an empty value. Both map to the "unclassified" bucket, but the
+    # distinction is preserved for diagnostics.
+    body_part_examined: str | None
     transfer_syntax_uid: str
     pixel_data: bytes | None
     # Original UIDs found in ReferencedSOPInstanceUID elements (any depth).
@@ -138,6 +143,10 @@ def parse_and_validate(raw: bytes) -> ParsedObject:
                     )
 
     sha256 = hashlib.sha256(raw).hexdigest()
+    if "BodyPartExamined" in ds:
+        body_part = str(getattr(ds, "BodyPartExamined", "") or "").strip()
+    else:
+        body_part = None
     return ParsedObject(
         raw=raw,
         sha256=sha256,
@@ -146,10 +155,32 @@ def parse_and_validate(raw: bytes) -> ParsedObject:
         original_series_uid=str(ds.SeriesInstanceUID).strip(),
         original_sop_uid=str(ds.SOPInstanceUID).strip(),
         modality=str(getattr(ds, "Modality", "") or "").strip() or None,
+        body_part_examined=body_part or None,
         transfer_syntax_uid=tsuid,
         pixel_data=getattr(ds, "PixelData", None),
         referenced_sop_uids=_collect_referenced_sop_uids(ds),
     )
+
+
+def read_body_part_examined(path: str) -> str | None:
+    """Read the raw BodyPartExamined value from a stored DICOM object.
+
+    Used by the background index rebuild, which must parse DICOM files without
+    holding any writer transaction on the production database. Raises
+    :class:`DicomValidationError` (or any pydicom error) when the object cannot
+    be read; the caller turns that into a failed replacement with the instance
+    identity and reason.
+    """
+    try:
+        ds = pydicom.dcmread(path, force=False, stop_before_pixels=True)
+    except FileNotFoundError as exc:
+        raise DicomValidationError(f"stored object not found: {path}") from exc
+    except Exception as exc:
+        raise DicomValidationError(f"not a readable DICOM object: {exc}") from exc
+    if "BodyPartExamined" not in ds:
+        return None
+    value = str(getattr(ds, "BodyPartExamined", "") or "").strip()
+    return value or None
 
 
 def rewrite_uids(ds: Dataset, map_fn: Callable[[str, str], str]) -> None:

@@ -44,6 +44,54 @@ REF_SERIES_UID = "1.9.84.20261112.50.1"
 REF_TARGET_SOP_UID = "1.9.84.20261112.60.200"
 REF_STRUCT_SOP_UID = "1.9.84.20261112.60.201"
 
+# Body-part dictionary scenario. The same anatomical regions are spelled
+# differently (or omitted) across centers. Each file below has a unique SOP.
+BP_STUDY_UID = "1.9.84.20261112.80.1"
+BP_SERIES_UID = "1.9.84.20261112.81.1"
+BP_SOP_BASE = "1.9.84.20261112.82."
+
+
+def make_body_part_samples(root: Path) -> None:
+    """Create one object per (center, raw BodyPartExamined) spelling.
+
+    * center-a uses uppercase DICOM-style words;
+    * center-b uses pinyin abbreviations and a local code;
+    * center-c sends a lowercase spelling, an empty value and an object where
+      the attribute is absent entirely.
+
+    Raw values deliberately collide semantically but never textually across
+    centers (note case-sensitive ``CHEST`` vs ``chest``), so an exact-match
+    per-center dictionary is required to unify them.
+    """
+    cases = [
+        # (center, file name, sop suffix, raw value, pixel multiplier)
+        ("center-a", "a_chest_01.dcm", 101, "CHEST"),
+        ("center-a", "a_hn_01.dcm", 102, "NECK"),
+        ("center-a", "a_unknown_01.dcm", 103, "TORSO"),  # unmapped raw value
+        ("center-b", "b_xiong_01.dcm", 201, "XIONG"),
+        ("center-b", "b_headneck_01.dcm", 202, "HN"),
+        ("center-c", "c_chest_01.dcm", 301, "chest"),
+        ("center-c", "c_empty_01.dcm", 302, ""),        # empty value
+    ]
+    for center, name, suffix, raw in cases:
+        make_ct_image(
+            root / "bp-dict" / center / name,
+            study_uid=BP_STUDY_UID,
+            series_uid=BP_SERIES_UID,
+            sop_uid=f"{BP_SOP_BASE}{suffix}",
+            pixel_value=suffix * 10,
+            body_part_examined=raw,
+        )
+    # Attribute entirely absent -> also UNCLASSIFIED.
+    make_ct_image(
+        root / "bp-dict" / "center-c" / "c_missing_01.dcm",
+        study_uid=BP_STUDY_UID,
+        series_uid=BP_SERIES_UID,
+        sop_uid=f"{BP_SOP_BASE}303",
+        pixel_value=3030,
+        body_part_examined=None,
+    )
+
 
 def _file_meta(sop_class_uid: str, sop_instance_uid: str) -> FileMetaDataset:
     meta = FileMetaDataset()
@@ -72,12 +120,17 @@ def make_ct_image(
     sop_uid: str,
     pixel_value: int,
     modality: str = "CT",
+    body_part_examined: str | None = None,
 ) -> Path:
     ds = _base_dataset(str(path), _file_meta(CT_SOP_CLASS, sop_uid))
     ds.StudyInstanceUID = study_uid
     ds.SeriesInstanceUID = series_uid
     ds.SOPInstanceUID = sop_uid
     ds.Modality = modality
+    if body_part_examined is not None:
+        # (0018,0015) Code String. Written verbatim so each center can use its
+        # own spelling/casing for the body-part dictionary demo.
+        ds.BodyPartExamined = body_part_examined
     ds.SeriesNumber = 1
     ds.InstanceNumber = 1
     ds.SamplesPerPixel = 1
@@ -171,6 +224,9 @@ def generate(root: Path) -> None:
     invalid = root / "invalid" / "not_a_dicom.dcm"
     invalid.parent.mkdir(parents=True, exist_ok=True)
     invalid.write_bytes(b"this is definitely not a DICOM file\n" * 4)
+
+    # --- Scenario 4: heterogeneous BodyPartExamined spellings per center. ---
+    make_body_part_samples(root)
 
     for path in sorted(root.rglob("*")):
         if path.is_file():

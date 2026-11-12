@@ -2,24 +2,28 @@
 
 Endpoints
 ---------
-POST /api/v1/batches                 upload a batch (multipart, <= 20 files)
-GET  /api/v1/batches/{batch_id}      batch status and per-file UID mapping
-GET  /api/v1/batches                 list batches (filter by center)
-GET  /api/v1/instances               search instances / inspect UID mapping
-GET  /api/v1/instances/{id}/download download the rewritten DICOM object
-GET  /api/v1/references/pending      reference-first bookkeeping per center
-GET  /healthz                        liveness probe
-GET  /docs                           interactive Swagger UI
+POST /api/v1/batches                    upload a batch (multipart, <= 20 files)
+GET  /api/v1/batches/{batch_id}         batch status and per-file UID mapping
+GET  /api/v1/batches                    list batches (filter by center)
+GET  /api/v1/instances                  search instances / inspect UID mapping
+GET  /api/v1/instances/{id}/download    download the rewritten DICOM object
+GET  /api/v1/references/pending         reference-first bookkeeping per center
+POST /api/v1/body-part/dictionaries     submit a full dictionary, rebuild index
+GET  /api/v1/body-part/rebuilds[/{id}]  replacement history / one rebuild status
+GET  /api/v1/body-part/active           active dictionary info (503 if none)
+GET  /api/v1/body-part/instances        cohort query: center + standard body part
+GET  /healthz                           liveness probe
+GET  /docs                              interactive Swagger UI
 """
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from . import config
+from . import bodypart, config
 from .config import MAX_FILE_BYTES, MAX_FILES_PER_BATCH
 from .db import get_connection, init_db
 from .service import IngestionError, UploadedFile, ingest_batch
@@ -29,6 +33,10 @@ from .service import IngestionError, UploadedFile, ingest_batch
 async def lifespan(_app: FastAPI):
     # Create / migrate the schema before accepting traffic.
     init_db()
+    # A rebuild left in 'building' by a killed process can never finish; mark
+    # it failed so the old active index remains the served one and a new
+    # replacement is allowed.
+    bodypart.recover_interrupted_rebuilds()
     yield
 
 
@@ -40,7 +48,11 @@ app = FastAPI(
         "Ingests Explicit VR Little Endian DICOM objects from multiple source "
         "centers, deterministically remaps every instance/study/series UID "
         "(including nested references) per center, and guarantees atomic, "
-        "idempotent batches."
+        "idempotent batches. Also maintains a replaceable body-part index: a "
+        "complete center + raw BodyPartExamined -> standard body-part "
+        "dictionary is rebuilt in the background and switched over atomically, "
+        "with exact-match classification and an UNCLASSIFIED bucket for empty "
+        "or unmapped values."
     ),
 )
 
@@ -98,6 +110,70 @@ class PendingReference(BaseModel):
     new_referenced_uid: str
     source_instance_id: int
     resolved: bool
+
+
+# --------------------------------------------------------------------------- #
+# Body-part dictionary / index schemas
+# --------------------------------------------------------------------------- #
+class BodyPartMappingEntry(BaseModel):
+    center_id: str = Field(
+        ..., description="Source center identifier, exactly as used at ingest."
+    )
+    original_value: str = Field(
+        ...,
+        description=(
+            "Raw BodyPartExamined value as written by that center. Matching is "
+            "exact and case-sensitive. An empty value is classified as "
+            "UNCLASSIFIED automatically and must not be submitted."
+        ),
+    )
+    standard_body_part: str = Field(
+        ..., description="Canonical body-part label used for cohort queries."
+    )
+
+
+class DictionarySubmission(BaseModel):
+    version_label: str = Field(
+        ...,
+        description=(
+            "Unique label for this dictionary version, e.g. 'bodypart-v1'."
+        ),
+    )
+    entries: list[BodyPartMappingEntry] = Field(
+        ...,
+        description=(
+            "The COMPLETE center + raw-value -> standard-body-part dictionary."
+        ),
+    )
+
+
+class RebuildResult(BaseModel):
+    id: int
+    dict_id: int
+    version_label: str
+    entry_count: int
+    status: str
+    error_detail: str | None
+    created_at: str
+    finished_at: str | None
+
+
+class ActiveDictionaryInfo(BaseModel):
+    dict_id: int
+    rebuild_id: int
+    version_label: str
+    entry_count: int
+    indexed_instances: int
+
+
+class BodyPartInstance(BaseModel):
+    instance_id: int
+    center_id: str
+    new_sop_uid: str
+    original_body_part: str | None
+    standard_body_part: str
+    dict_id: int
+    download_url: str
 
 
 # --------------------------------------------------------------------------- #
@@ -315,3 +391,117 @@ def healthz() -> dict:
     finally:
         conn.close()
     return {"status": "ok"}
+
+
+# --------------------------------------------------------------------------- #
+# Body-part dictionary replacement and cohort queries
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/api/v1/body-part/dictionaries",
+    response_model=RebuildResult,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["body-part"],
+    summary=(
+        "Submit a complete body-part dictionary and start an atomic index "
+        "rebuild"
+    ),
+)
+def submit_body_part_dictionary(payload: DictionarySubmission) -> RebuildResult:
+    try:
+        result = bodypart.submit_dictionary(
+            [entry.model_dump() for entry in payload.entries],
+            payload.version_label,
+        )
+    except bodypart.BodyPartError as exc:
+        raise HTTPException(exc.http_status, str(exc)) from exc
+    return RebuildResult(**result)
+
+
+@app.get(
+    "/api/v1/body-part/rebuilds/{rebuild_id}",
+    response_model=RebuildResult,
+    tags=["body-part"],
+    summary="Inspect one dictionary replacement (progress / failure reason)",
+)
+def get_body_part_rebuild(rebuild_id: int) -> RebuildResult:
+    try:
+        result = bodypart.get_rebuild(rebuild_id)
+    except bodypart.BodyPartError as exc:
+        raise HTTPException(exc.http_status, str(exc)) from exc
+    return RebuildResult(**result)
+
+
+@app.get(
+    "/api/v1/body-part/rebuilds",
+    response_model=list[RebuildResult],
+    tags=["body-part"],
+    summary="List dictionary replacements, newest first",
+)
+def list_body_part_rebuilds(
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> list[RebuildResult]:
+    return [RebuildResult(**row) for row in bodypart.list_rebuilds(limit, offset)]
+
+
+@app.get(
+    "/api/v1/body-part/active",
+    response_model=ActiveDictionaryInfo,
+    tags=["body-part"],
+    summary="Show the dictionary currently backing cohort queries",
+)
+def get_active_body_part_dictionary() -> ActiveDictionaryInfo:
+    info = bodypart.get_active_dictionary_info()
+    if info is None:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "body-part index is not ready: no dictionary has been activated yet",
+        )
+    return ActiveDictionaryInfo(**info)
+
+
+@app.get(
+    "/api/v1/body-part/instances",
+    response_model=list[BodyPartInstance],
+    tags=["body-part"],
+    summary=(
+        "Cohort query: instance ids and download URLs by center + standard "
+        "body part"
+    ),
+)
+def query_body_part_instances(
+    request: Request,
+    center_id: str = Query(
+        ..., description="Center scope; classification never crosses centers."
+    ),
+    standard_body_part: str = Query(
+        ...,
+        description=(
+            "Canonical label from the active dictionary. Use 'UNCLASSIFIED' "
+            "for empty/unmapped raw values."
+        ),
+    ),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> list[BodyPartInstance]:
+    try:
+        rows = bodypart.search_instances(
+            center_id, standard_body_part, limit, offset
+        )
+    except bodypart.BodyPartError as exc:
+        raise HTTPException(exc.http_status, str(exc)) from exc
+    base = str(request.base_url).rstrip("/")
+    return [
+        BodyPartInstance(
+            instance_id=row["instance_id"],
+            center_id=row["center_id"],
+            new_sop_uid=row["new_sop_uid"],
+            original_body_part=row["original_body_part"],
+            standard_body_part=row["standard_body_part"],
+            dict_id=row["dict_id"],
+            download_url=(
+                f"{base}/api/v1/instances/{row['instance_id']}/download"
+            ),
+        )
+        for row in rows
+    ]

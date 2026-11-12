@@ -18,12 +18,13 @@ def data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # Keep the env var and every module-level path binding in sync. All
     # modules read these attributes at call time.
     monkeypatch.setenv("DICOM_INGEST_DATA_DIR", str(target))
-    from app import config, db
+    from app import config, db  # noqa: F401
     storage = target / "objects"
+    # db.get_connection() reads config.DB_PATH at call time, so patching the
+    # config module redirects request threads and background rebuild threads.
     monkeypatch.setattr(config, "DATA_DIR", target)
     monkeypatch.setattr(config, "DB_PATH", target / "ingest.db")
     monkeypatch.setattr(config, "STORAGE_DIR", storage)
-    monkeypatch.setattr(db, "DB_PATH", target / "ingest.db")
     yield target
 
 
@@ -35,6 +36,13 @@ def client(data_dir: Path):
     main.init_db()
     with TestClient(main.app) as test_client:
         yield test_client
+    # Wait for any background rebuild threads spawned during the test so they
+    # never keep running against a torn-down temp data directory afterwards.
+    import threading
+    for thread in list(threading.enumerate()):
+        if thread.name.startswith("bodypart-rebuild-") and thread.is_alive():
+            thread.join(timeout=30)
+            assert not thread.is_alive(), f"{thread.name} did not finish"
 
 
 @pytest.fixture(scope="session")

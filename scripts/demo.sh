@@ -80,5 +80,108 @@ curl -sS -o "$WORK/inv.json" -w "HTTP %{http_code}\n" -X POST "$BASE_URL/api/v1/
 cat "$WORK/inv.json"; echo
 curl -sS "$BASE_URL/api/v1/batches?center_id=center-z"; echo "  (empty list above)"
 
+# --------------------------------------------------------------------------- #
+# Body-part dictionary replacement, cohort filtering and download
+# --------------------------------------------------------------------------- #
+BP="$SAMPLES/bp-dict"
+
+say "9. BODY-PART INDEX NOT READY before the first dictionary (expect 503)"
+curl -sS -o /dev/null -w "HTTP %{http_code}\n" \
+  "$BASE_URL/api/v1/body-part/instances?center_id=center-a&standard_body_part=CHEST"
+
+say "10. Ingest objects whose BodyPartExamined spelling differs per center"
+for c in center-a center-b center-c; do
+  post_batch "$c" "$BP/$c"/*.dcm > /dev/null
+  echo "  $c ingested"
+done
+
+say "11. Submit the COMPLETE v1 dictionary -> background rebuild (202)"
+cat > "$WORK/dict-v1.json" <<'JSON'
+{
+  "version_label": "bodypart-demo-v1",
+  "entries": [
+    {"center_id": "center-a", "original_value": "CHEST", "standard_body_part": "CHEST"},
+    {"center_id": "center-a", "original_value": "NECK",  "standard_body_part": "HEAD-NECK"},
+    {"center_id": "center-b", "original_value": "XIONG", "standard_body_part": "CHEST"},
+    {"center_id": "center-b", "original_value": "HN",    "standard_body_part": "HEAD-NECK"},
+    {"center_id": "center-c", "original_value": "chest", "standard_body_part": "CHEST"}
+  ]
+}
+JSON
+RID=$(curl -sS -X POST "$BASE_URL/api/v1/body-part/dictionaries" \
+  -H 'Content-Type: application/json' --data @"$WORK/dict-v1.json" \
+  | tee "$WORK/r1.json" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+echo "rebuild id=$RID; polling until active..."
+for _ in $(seq 1 100); do
+  ST=$(curl -sS "$BASE_URL/api/v1/body-part/rebuilds/$RID" \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')
+  [ "$ST" != "building" ] && break
+  sleep 0.2
+done
+echo "v1 rebuild -> $ST"
+curl -sS "$BASE_URL/api/v1/body-part/active" | python3 -m json.tool
+
+say "12. Cohort query: CHEST unifies center-a CHEST and center-b XIONG"
+curl -sS "$BASE_URL/api/v1/body-part/instances?center_id=center-a&standard_body_part=CHEST" \
+  | python3 -m json.tool
+curl -sS "$BASE_URL/api/v1/body-part/instances?center_id=center-b&standard_body_part=CHEST" \
+  | python3 -c 'import json,sys;d=json.load(sys.stdin);print("center-b CHEST raw values:",[r["original_body_part"] for r in d])'
+
+say "13. Unmapped / empty / missing values are all UNCLASSIFIED"
+curl -sS "$BASE_URL/api/v1/body-part/instances?center_id=center-c&standard_body_part=UNCLASSIFIED" \
+  | python3 -c 'import json,sys;d=json.load(sys.stdin);print("center-c UNCLASSIFIED count:",len(d),"raw:",[r["original_body_part"] for r in d])'
+
+say "14. Retransmit during active dictionary: reused, no duplicate index row"
+post_batch center-c "$BP/center-c"/*.dcm \
+  | python3 -c 'import json,sys;print("reused_count:",json.load(sys.stdin)["reused_count"])'
+
+say "15. Download an object straight from the cohort query result"
+DL=$(curl -sS "$BASE_URL/api/v1/body-part/instances?center_id=center-b&standard_body_part=CHEST" \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["download_url"])')
+echo "download_url=$DL"
+curl -sS -o "$WORK/cohort.dcm" -w "HTTP %{http_code} %{content_type}\n" "$DL"
+python3 - "$WORK/cohort.dcm" <<'PY'
+import sys, pydicom
+ds = pydicom.dcmread(sys.argv[1])
+print("downloaded object BodyPartExamined:", ds.BodyPartExamined, "Modality:", ds.Modality)
+PY
+
+say "16. Replace with v2 (CHEST cohort renamed THORAX): atomic single-dictionary switch"
+cat > "$WORK/dict-v2.json" <<'JSON'
+{
+  "version_label": "bodypart-demo-v2",
+  "entries": [
+    {"center_id": "center-a", "original_value": "CHEST", "standard_body_part": "THORAX"},
+    {"center_id": "center-b", "original_value": "XIONG", "standard_body_part": "THORAX"},
+    {"center_id": "center-c", "original_value": "chest", "standard_body_part": "THORAX"},
+    {"center_id": "center-a", "original_value": "NECK",  "standard_body_part": "HEAD-NECK"},
+    {"center_id": "center-b", "original_value": "HN",    "standard_body_part": "HEAD-NECK"}
+  ]
+}
+JSON
+RID2=$(curl -sS -X POST "$BASE_URL/api/v1/body-part/dictionaries" \
+  -H 'Content-Type: application/json' --data @"$WORK/dict-v2.json" \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
+for _ in $(seq 1 100); do
+  ST=$(curl -sS "$BASE_URL/api/v1/body-part/rebuilds/$RID2" \
+    | python3 -c 'import json,sys;print(json.load(sys.stdin)["status"])')
+  [ "$ST" != "building" ] && break
+  sleep 0.2
+done
+echo "v2 rebuild -> $ST"
+echo -n "old CHEST label now returns: "
+curl -sS "$BASE_URL/api/v1/body-part/instances?center_id=center-a&standard_body_part=CHEST"; echo
+curl -sS "$BASE_URL/api/v1/body-part/instances?center_id=center-a&standard_body_part=THORAX" \
+  | python3 -c 'import json,sys;d=json.load(sys.stdin);print("new THORAX cohort:",[(r["standard_body_part"],r["dict_id"]) for r in d])'
+echo "replacement history:"
+curl -sS "$BASE_URL/api/v1/body-part/rebuilds" \
+  | python3 -c 'import json,sys;[print(" ",r["id"],r["version_label"],r["status"]) for r in json.load(sys.stdin)]'
+
+say "17. Single-flight: a second replacement while one runs is rejected (409)"
+curl -sS -o /dev/null -w "duplicate version label -> HTTP %{http_code}\n" \
+  -X POST "$BASE_URL/api/v1/body-part/dictionaries" \
+  -H 'Content-Type: application/json' --data @"$WORK/dict-v2.json"
+
 echo
 echo "Interactive docs: open $BASE_URL/docs in a browser."
+echo "Body-part endpoints are grouped under the 'body-part' tag."
